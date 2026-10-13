@@ -1,0 +1,210 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use Emorfiq\Common\Duration;
+use Emorfiq\Common\FrozenClock;
+use Emorfiq\Common\SystemClock;
+use Emorfiq\Mutex\StoreMutex;
+use Emorfiq\Mutex\Store\InMemoryLockStore;
+use Emorfiq\Scheduler\Adapter\Crunz\CrunzScheduleEngine;
+use Emorfiq\Scheduler\Definition\ConsoleTask;
+use Emorfiq\Scheduler\Definition\HandlerTask;
+use Emorfiq\Scheduler\Definition\ShellTask;
+use Emorfiq\Scheduler\Demo\DemoScheduleProvider;
+use Emorfiq\Scheduler\Demo\Handlers\FlakyHandler;
+use Emorfiq\Scheduler\Demo\Handlers\HeartbeatHandler;
+use Emorfiq\Scheduler\Demo\Handlers\SendScheduledReports;
+use Emorfiq\Scheduler\DispatchingScheduleRunner;
+use Emorfiq\Scheduler\Execution\ArrayTaskHandlerResolver;
+use Emorfiq\Scheduler\Execution\LockingTaskRunner;
+use Emorfiq\Scheduler\Execution\NativeTaskExecutor;
+use Emorfiq\Scheduler\LockScope;
+use Emorfiq\Scheduler\LockingScheduleRunner;
+use Emorfiq\Scheduler\NativeScheduleEngine;
+use Emorfiq\Scheduler\ScheduleEngine;
+use Emorfiq\Scheduler\ScheduleRunReport;
+use Emorfiq\Scheduler\TaskStatus;
+
+$autoload = __DIR__ . '/../vendor/autoload.php';
+if (!is_file($autoload)) {
+    fwrite(STDERR, "Autoloader missing. Run: composer dump-autoload\n");
+    exit(2);
+}
+require $autoload;
+
+/**
+ * Tiny demo CLI. In a real app this would be a framework console command; here
+ * it is the "cron adapter" the PDF describes — the thing cron calls every minute.
+ *
+ *   bin/scheduler tick [--now="2026-10-13 03:00"] [--engine=native|crunz]
+ *   bin/scheduler list
+ */
+
+$argv = $_SERVER['argv'];
+array_shift($argv);
+
+$command = 'tick';
+$options = [];
+foreach ($argv as $arg) {
+    if (str_starts_with($arg, '--')) {
+        [$name, $value] = array_pad(explode('=', substr($arg, 2), 2), 2, true);
+        $options[$name] = $value;
+    } else {
+        $command = $arg;
+    }
+}
+
+// --- wiring ------------------------------------------------------------------
+
+$clock = isset($options['now'])
+    ? new FrozenClock(new \DateTimeImmutable((string) $options['now'], new \DateTimeZone('UTC')))
+    : new SystemClock();
+
+$store = new InMemoryLockStore($clock);
+$mutex = new StoreMutex($store, $clock);
+
+$resolver = new ArrayTaskHandlerResolver([
+    HeartbeatHandler::class => new HeartbeatHandler(),
+    SendScheduledReports::class => new SendScheduledReports(),
+    FlakyHandler::class => new FlakyHandler(),
+]);
+
+$executor = new NativeTaskExecutor($resolver);
+$taskRunner = new LockingTaskRunner($mutex, $executor);
+
+$engineName = (string) ($options['engine'] ?? 'native');
+$engine = makeEngine($engineName, $taskRunner);
+
+$provider = new DemoScheduleProvider();
+
+// --- commands ----------------------------------------------------------------
+
+exit(match ($command) {
+    'tick' => runTick($provider, $engine, $clock, $mutex, $engineName),
+    'list' => listSchedule($provider),
+    default => fail("Unknown command \"$command\". Use: tick | list"),
+});
+
+// --- helpers -----------------------------------------------------------------
+
+function makeEngine(string $name, LockingTaskRunner $runner): ScheduleEngine
+{
+    return match ($name) {
+        'native' => new NativeScheduleEngine($runner),
+        'crunz' => new CrunzScheduleEngine($runner),
+        default => throw new \InvalidArgumentException("Unknown engine \"$name\". Use: native | crunz"),
+    };
+}
+
+function runTick(
+    DemoScheduleProvider $provider,
+    ScheduleEngine $engine,
+    \Emorfiq\Common\Clock $clock,
+    \Emorfiq\Mutex\Mutex $mutex,
+    string $engineName
+): int {
+    $dispatching = new DispatchingScheduleRunner($provider, $engine, $clock);
+    $runner = new LockingScheduleRunner($dispatching, $mutex, $clock, Duration::fromSeconds(90));
+
+    $engineNote = $engine instanceof CrunzScheduleEngine ? ' (' . $engine->usingLibrary() . ')' : '';
+    fwrite(STDOUT, sprintf(
+        "tick @ %s  ·  engine=%s%s\n\n",
+        $clock->now()->format('Y-m-d H:i:s T'),
+        $engineName,
+        $engineNote
+    ));
+
+    $report = $runner->tick();
+    printReport($report);
+
+    return $report->exitCode();
+}
+
+function printReport(ScheduleRunReport $report): void
+{
+    if ($report->wasTickSkipped()) {
+        fwrite(STDOUT, sprintf(
+            "  TICK SKIPPED — lock \"%s\" held by another node.\n",
+            $report->tickLockKey?->toString() ?? '?'
+        ));
+        fwrite(STDOUT, "\n  exit code: " . $report->exitCode() . "\n");
+        return;
+    }
+
+    if ($report->results === []) {
+        fwrite(STDOUT, "  Nothing was due.\n");
+    }
+
+    foreach ($report->results as $result) {
+        $line = sprintf("  %-9s %s", statusLabel($result->status), $result->taskId->toString());
+        if ($result->error !== null) {
+            $line .= '  — ' . $result->error->getMessage();
+        }
+        fwrite(STDOUT, $line . "\n");
+    }
+
+    fwrite(STDOUT, sprintf(
+        "\n  summary: %d succeeded, %d failed, %d skipped, %d timed out\n",
+        $report->countByStatus(TaskStatus::Succeeded),
+        $report->countByStatus(TaskStatus::Failed),
+        $report->countByStatus(TaskStatus::Skipped),
+        $report->countByStatus(TaskStatus::TimedOut),
+    ));
+    fwrite(STDOUT, '  exit code: ' . $report->exitCode() . "\n");
+}
+
+function listSchedule(DemoScheduleProvider $provider): int
+{
+    $schedule = $provider->provide();
+    fwrite(STDOUT, sprintf("%d scheduled task(s):\n\n", count($schedule)));
+
+    foreach ($schedule as $task) {
+        fwrite(STDOUT, sprintf(
+            "  %-24s %-12s %-16s %-10s %s\n",
+            $task->id->toString(),
+            $task->expression->toString(),
+            $task->timezone->getName(),
+            lockLabel($task->lockPolicy->scope),
+            definitionLabel($task->definition),
+        ));
+    }
+
+    return 0;
+}
+
+function statusLabel(TaskStatus $status): string
+{
+    return match ($status) {
+        TaskStatus::Succeeded => 'OK',
+        TaskStatus::Failed => 'FAILED',
+        TaskStatus::Skipped => 'SKIPPED',
+        TaskStatus::TimedOut => 'TIMEOUT',
+    };
+}
+
+function lockLabel(LockScope $scope): string
+{
+    return match ($scope) {
+        LockScope::None => 'no-lock',
+        LockScope::Server => 'server',
+        LockScope::Cluster => 'cluster',
+    };
+}
+
+function definitionLabel(object $definition): string
+{
+    return match (true) {
+        $definition instanceof HandlerTask => 'handler ' . $definition->handlerClass,
+        $definition instanceof ShellTask => 'shell   ' . $definition->command,
+        $definition instanceof ConsoleTask => 'console ' . $definition->command,
+        default => $definition::class,
+    };
+}
+
+function fail(string $message): int
+{
+    fwrite(STDERR, $message . "\n");
+    return 2;
+}

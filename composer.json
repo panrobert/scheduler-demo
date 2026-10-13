@@ -1,0 +1,38 @@
+{
+    "name": "emorfiq/scheduler-demo",
+    "description": "Framework-agnostic Scheduler + Mutex reference implementation (interview demo).",
+    "type": "library",
+    "license": "proprietary",
+    "require": {
+        "php": ">=8.3"
+    },
+    "require-dev": {
+        "dragonmantank/cron-expression": "^3.3",
+        "phpunit/phpunit": "^11.0"
+    },
+    "suggest": {
+        "dragonmantank/cron-expression": "Lets the crunz-style ScheduleEngine adapter evaluate cron with the same library crunz uses internally."
+    },
+    "autoload": {
+        "psr-4": {
+            "Emorfiq\\Common\\": "src/Common/",
+            "Emorfiq\\Mutex\\": "src/Mutex/",
+            "Emorfiq\\Scheduler\\": "src/Scheduler/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Emorfiq\\Scheduler\\Demo\\": "demo/",
+            "Emorfiq\\Tests\\": "tests/"
+        }
+    },
+    "bin": [
+        "bin/scheduler"
+    ],
+    "config": {
+        "sort-packages": true
+    },
+    "scripts": {
+        "test": "phpunit"
+    }
+}
